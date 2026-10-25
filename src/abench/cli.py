@@ -4,18 +4,25 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import __version__
+from .attempts import measured_attempts
+from .awake import benchmark_invocation, keep_awake
 from .common import read_json, write_json
+from .failures import BenchmarkFailure, describe_failure
+from .flow_cache import publish_flows, reuse_flows
 from .profiles import load_profile, validate_model
+from .progress import run_logged
 from .report import load_run, report
 from .sources import resolve_sources
 
@@ -25,8 +32,7 @@ PACKAGE = Path(__file__).resolve().parent
 def command(args, log=None):
     """Keep build/run output on disk and propagate failures to the caller."""
     if log:
-        with log.open("w") as stream:
-            subprocess.run(args, stdout=stream, stderr=subprocess.STDOUT, check=True)
+        run_logged(args, log)
     else:
         return subprocess.check_output(args, text=True).strip()
 
@@ -55,8 +61,14 @@ def positive(value):
 def parser():
     p = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Named experiments: abench experiments.yaml; preflight: abench validate experiments.yaml",
+        epilog="Named experiments: abench experiments.yaml [--set NAME=VALUE]; preflight: abench validate experiments.yaml [--set NAME=VALUE]; data only: abench prepare experiments.yaml; publish retained results: abench publish OUTPUT_DIRECTORY [--dry-run]",
     )
+    p.add_argument(
+        "--allow-sleep",
+        action="store_true",
+        help="disable automatic macOS idle sleep prevention",
+    )
+    p.add_argument("--version", action="version", version=f"abench {__version__}")
     p.add_argument("--model-dir", type=Path, default=Path.cwd())
     p.add_argument("--profile", default="benchmark.yaml")
     p.add_argument(
@@ -83,6 +95,18 @@ def parser():
     p.add_argument(
         "--households", type=int, default=1000, help="0 means full population"
     )
+    p.add_argument(
+        "--warmup-households",
+        type=int,
+        default=5000,
+        help="maximum cache-build households (default: 5000); warmup is always single-process",
+    )
+    p.add_argument(
+        "--cache-retries",
+        type=int,
+        default=2,
+        help="additional attempts after completed runs compile flows (default: 2)",
+    )
     p.add_argument("--data-dir", type=Path, default=None)
     p.add_argument(
         "--config-overlay",
@@ -90,6 +114,18 @@ def parser():
         nargs="+",
         default=[],
         help="extra config directories, highest priority first",
+    )
+    p.add_argument(
+        "--flow-cache-dir",
+        type=Path,
+        default=Path.home() / ".cache/abench/flows",
+        help="persistent compiled-flow cache (default: ~/.cache/abench/flows)",
+    )
+    p.add_argument(
+        "--reuse-flows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="automatically reuse and update compatible flows; warmup still runs",
     )
     p.add_argument(
         "--cache-from",
@@ -148,13 +184,32 @@ def mount(source, target, readonly=False):
 def container_phase(spec, output, data, image, phase_name):
     """Retain Docker exit/OOM state even when the supervisor cannot finish."""
     phase = output / phase_name
-    phase.mkdir()
+    phase.mkdir(parents=True)
+    phase_kind = "warmup" if phase_name == "warmup" else "measured"
     name = "abench-" + uuid.uuid4().hex[:12]
+    # Each container reads an immutable, uniquely named settings snapshot. Reusing
+    # the mutable root manifest across Docker Desktop mounts can expose stale data.
+    snapshot_name = f"spec-{name}.json"
+    write_json(phase / snapshot_name, spec)
     args = [
         "docker",
         "run",
         "--name",
         name,
+        # Native Linux bind mounts preserve ownership. Run as the invoking user
+        # so outputs and caches remain writable between attempts and experiments.
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
+        # Installed packages and the default home are not writable by this UID.
+        # Configure Numba before Python starts, including all spawned workers.
+        # Keep compiled artifacts in the shared flow snapshot so warmup work is
+        # reusable across measured attempts and compatible experiments.
+        "--env",
+        "NUMBA_CACHE_DIR=/results/cache/flows/.numba",
+        "--env",
+        f"BENCH_SPEC_PATH=/results/{phase_name}/{snapshot_name}",
+        "--env",
+        f"BENCH_PHASE_NAME={phase_kind}",
         "--cgroupns=private",
         "--memory",
         spec["memory"],
@@ -191,20 +246,96 @@ def container_phase(spec, output, data, image, phase_name):
 def main(argv=None):
     p = parser()
     argv = list(sys.argv[1:] if argv is None else argv)
+    if argv and argv[0] == "publish":
+        from .publishing import publish
+
+        publish_parser = argparse.ArgumentParser(prog="abench publish")
+        publish_parser.add_argument("output_directory", type=Path)
+        publish_mode = publish_parser.add_mutually_exclusive_group()
+        publish_mode.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="generate the local bundle without GitHub access",
+        )
+        publish_mode.add_argument(
+            "--status",
+            action="store_true",
+            help="show recorded publication status without contacting GitHub",
+        )
+        publish_mode.add_argument(
+            "--verify",
+            action="store_true",
+            help="check publication status on GitHub without posting",
+        )
+        options = publish_parser.parse_args(argv[1:])
+        publish(
+            options.output_directory,
+            dry_run=options.dry_run,
+            status_only=options.status,
+            verify=options.verify,
+        )
+        return 0
     # A file invocation stays separate from model profiles and ordinary flags.
-    candidate = argv[1:] if argv and argv[0] in ("run", "validate") else argv
+    candidate = argv[1:] if argv and argv[0] in ("run", "validate", "prepare") else argv
     if (
         candidate
         and not candidate[0].startswith("-")
-        and candidate[0] not in ("run", "report", "validate")
+        and candidate[0] not in ("run", "report", "validate", "prepare")
     ):
-        if len(candidate) != 1:
-            p.error(
-                "an experiment file cannot be mixed with command-line overrides; edit its defaults or runs"
-            )
-        from .experiments import run_suite
+        from .discovery import directory_help, select_experiment
+        from .experiments import read_suite, run_suite
+        from .inputs import input_help
 
-        return run_suite(Path(candidate[0]), main, validate_only=argv[0] == "validate")
+        target = Path(candidate[0]).expanduser()
+        suite_parser = argparse.ArgumentParser(
+            prog="abench",
+            description="Run an experiment YAML file or choose from a directory’s .abench folder.",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog=(
+                directory_help(target)
+                if target.is_dir()
+                else input_help(read_suite(target)[1])
+            )
+            if any(flag in candidate[1:] for flag in ("--help", "-h"))
+            else None,
+        )
+        suite_parser.add_argument(
+            "experiment_file", type=Path, help="experiment YAML file or model directory"
+        )
+        suite_parser.add_argument(
+            "--set",
+            action="append",
+            default=[],
+            metavar="NAME=VALUE",
+            help="override a declared experiment input (repeatable)",
+        )
+        suite_parser.add_argument(
+            "--non-interactive",
+            action="store_true",
+            help="use defaults and --set values without prompting (required inputs must be supplied)",
+        )
+        suite_parser.add_argument(
+            "--publish-dry-run",
+            action="store_true",
+            help="run benchmarks and prepare the comment and charts without publishing",
+        )
+        suite_parser.add_argument(
+            "--allow-sleep",
+            action="store_true",
+            help="disable automatic macOS idle sleep prevention",
+        )
+        suite_args = suite_parser.parse_args(candidate)
+        interactive = not suite_args.non_interactive and sys.stdin.isatty()
+        selected = select_experiment(suite_args.experiment_file, interactive)
+        return run_suite(
+            selected,
+            main,
+            prepare_only=argv[0] == "prepare",
+            validate_only=argv[0] == "validate",
+            assignments=suite_args.set,
+            interactive=interactive,
+            **({"publish_dry_run": True} if suite_args.publish_dry_run else {}),
+        )
     action = argv.pop(0) if argv and argv[0] in ("run", "report", "validate") else "run"
     args = p.parse_args(argv)
     if action == "report":
@@ -248,6 +379,10 @@ def main(argv=None):
     )
     if args.sharrow and not args.sharrow_commit:
         p.error("Sharrow enabled: provide a sharrow source override")
+    if args.cache_retries < 0:
+        p.error("--cache-retries must be nonnegative")
+    if args.warmup_households < 1:
+        p.error("--warmup-households must be positive")
     if args.households < 0:
         p.error("--households must be nonnegative")
     if args.multiprocess and (args.processes is None or args.processes < 1):
@@ -262,6 +397,12 @@ def main(argv=None):
     for path in overlays:
         if not path.is_dir() or (output is not None and output.is_relative_to(path)):
             p.error("config overlays must be existing directories outside --output-dir")
+    args.flow_cache_dir = args.flow_cache_dir.expanduser().resolve()
+    if args.sharrow and args.reuse_flows and output is not None:
+        if args.flow_cache_dir.is_relative_to(output) or output.is_relative_to(
+            args.flow_cache_dir
+        ):
+            p.error("--flow-cache-dir and --output-dir must be separate directories")
     seed = args.cache_from.expanduser().resolve() if args.cache_from else None
     if seed:
         prior = read_json(seed / "experiment.json", {})
@@ -279,7 +420,7 @@ def main(argv=None):
         p.error("Docker bind paths cannot contain commas")
     if output is not None and output.exists():
         p.error(
-            "--output-dir must not already exist; each experiment owns a fresh cache"
+            "--output-dir must not already exist; each experiment needs a separate output directory"
         )
     docker = json.loads(command(["docker", "info", "--format", "{{json .}}"]))
     if docker.get("OSType") != "linux" or str(docker.get("CgroupVersion")) != "2":
@@ -431,17 +572,74 @@ def main(argv=None):
         if seed:
             if (seed / "pip-freeze.txt").read_text().strip() != freeze.strip():
                 raise ValueError("Cannot seed cache: installed dependencies differ")
-            # Only flow artifacts are reused. Full warmup still checks coverage
-            # under the new configuration before compilation-blocked measurement.
+            # Only flow artifacts are reused. A small serial warmup prepares flows;
+            # measurement remains responsible for rejecting missing signatures.
             shutil.copytree(seed / "cache/flows", output / "cache/flows")
+        cache = nullcontext(None)
+        identity = None
         if args.sharrow:
             stage = "warmup"
-            print("Preparing Sharrow cache with a complete matching run…", flush=True)
-            container_phase(spec, output, data, image, "warmup")
-        stage = "measured"
-        print("Running measured model…", flush=True)
-        container_phase(spec, output, data, image, "measured")
+            print(
+                f"Preparing Sharrow cache in single process (up to {args.warmup_households} households)…",
+                flush=True,
+            )
+            cache = nullcontext(None)
+            if args.reuse_flows:
+                identity = json.loads(
+                    command(
+                        [
+                            "docker",
+                            "run",
+                            "--rm",
+                            "--network=none",
+                            "--entrypoint",
+                            "python",
+                            image,
+                            "-c",
+                            (PACKAGE / "runtime/cache_identity.py").read_text(),
+                        ]
+                    )
+                )
+                write_json(output / "flow-cache-identity.json", identity)
+                cache = reuse_flows(
+                    args.flow_cache_dir, identity, output / "cache/flows"
+                )
+                print(
+                    "Checking compatible flow cache (waiting for any active warmup)…",
+                    flush=True,
+                )
+        with cache as cache_info:
+
+            def publish_cache():
+                if cache_info is not None:
+                    publish_flows(identity, output / "cache/flows", cache_info)
+
+            if cache_info is not None:
+                spec["flow_cache"] = cache_info
+                write_json(output / "experiment.json", spec)
+                print(
+                    f"Reused {cache_info['restored_files']} flow-cache files.",
+                    flush=True,
+                )
+            if args.sharrow:
+                container_phase(spec, output, data, image, "warmup")
+                publish_cache()
+            write_json(output / "experiment.json", spec)
+            stage = "measured"
+            measured_attempts(
+                spec,
+                output,
+                lambda phase_name: container_phase(
+                    spec, output, data, image, phase_name
+                ),
+                publish_cache,
+            )
     except (Exception, KeyboardInterrupt) as error:
+        if isinstance(error, subprocess.CalledProcessError):
+            error = BenchmarkFailure(describe_failure(output, stage, ignore_cache=True))
+            spec["failure"] = {"phase": stage, "error": str(error)}
+            write_json(output / "experiment.json", spec)
+            raise error from None
         spec["failure"] = {"phase": stage, "error": str(error)}
         write_json(output / "experiment.json", spec)
         raise
@@ -454,7 +652,12 @@ def main(argv=None):
 def entrypoint():
     """Expose CLI errors without an unnecessary Python traceback."""
     try:
-        sys.exit(main())
+        with keep_awake(enabled=benchmark_invocation(sys.argv[1:])):
+            code = main()
+        sys.exit(code)
+    except KeyboardInterrupt:
+        print("\nBenchmark cancelled.", file=sys.stderr)
+        sys.exit(130)
     except (ValueError, OSError, subprocess.CalledProcessError) as error:
         print(f"Benchmark failed: {error}", file=sys.stderr)
         sys.exit(1)

@@ -8,9 +8,12 @@ from pathlib import Path
 
 import yaml
 
+from . import publishing
+from .assets import plan_assets, prepare_assets
 from .common import write_json
+from .inputs import resolve_inputs
 from .report import report
-from .sources import source
+from .sources import suite_source
 
 OPTIONS = {
     "model_dir",
@@ -22,9 +25,13 @@ OPTIONS = {
     "processes",
     "sharrow",
     "households",
+    "warmup_households",
+    "cache_retries",
     "data_dir",
     "config_overlay",
     "cache_from",
+    "flow_cache_dir",
+    "reuse_flows",
     "label",
     "compare",
     "interval",
@@ -32,7 +39,14 @@ OPTIONS = {
     "shm_size",
     "platform",
 }
-PATHS = {"model_dir", "data_dir", "cache_from", "config_overlay", "compare"}
+PATHS = {
+    "model_dir",
+    "data_dir",
+    "cache_from",
+    "flow_cache_dir",
+    "config_overlay",
+    "compare",
+}
 LISTS = {"config_overlay", "compare"}
 TOKEN = re.compile(r"\$\{([^{}]+)\}")
 
@@ -58,14 +72,14 @@ SuiteLoader.add_constructor(
 )
 
 
-def expand_variables(document, timestamp):
+def expand_variables(document, timestamp, inputs=None):
     """Resolve named terms recursively; never execute shell code or read env vars."""
     terms = document.get("vars", {})
     if not isinstance(terms, dict):
         raise ValueError("vars must be a mapping")
     if "timestamp" in terms:
         raise ValueError("timestamp is a reserved variable")
-    resolved = {"timestamp": timestamp}
+    resolved = {**(inputs or {}), "timestamp": timestamp}
 
     def term(name, stack):
         if name in resolved:
@@ -94,10 +108,10 @@ def expand_variables(document, timestamp):
 
     for name in terms:
         term(name, ())
-    return expand(document)
+    return {k: v if k == "inputs" else expand(v) for k, v in document.items()}
 
 
-def merge_options(defaults, overrides):
+def merge_options(defaults, overrides, resolutions=None):
     """Runs replace ordinary defaults; source pins merge by distribution name."""
     if not isinstance(overrides, dict):
         raise ValueError("defaults and each run must be option mappings")
@@ -105,13 +119,15 @@ def merge_options(defaults, overrides):
     if unknown:
         raise ValueError(f"unknown experiment options: {sorted(unknown)}")
     merged = dict(defaults, **overrides)
+    if resolutions is None:
+        resolutions = {}
     if "sources" in overrides:
         if not isinstance(overrides["sources"], list):
             raise ValueError("sources must be a list")
         pins = {item["name"]: item for item in defaults.get("sources", [])}
         seen = set()
         for value in overrides["sources"]:
-            item = source(value)
+            item = suite_source(value, resolutions)
             if item["name"] in seen:
                 raise ValueError(f"duplicate source: {item['name']}")
             seen.add(item["name"])
@@ -128,13 +144,13 @@ def arguments(options, base):
     for key, value in options.items():
         if value is None:
             continue
-        if key in ("multiprocess", "sharrow"):
+        if key in ("multiprocess", "sharrow", "reuse_flows"):
             if not isinstance(value, bool):
                 raise ValueError(f"{key} must be a YAML boolean")
             argv.append(
                 ("--multiprocess" if value else "--single-process")
                 if key == "multiprocess"
-                else ("--sharrow" if value else "--no-sharrow")
+                else ("--" if value else "--no-") + key.replace("_", "-")
             )
             continue
         if key == "sources":
@@ -165,8 +181,8 @@ def arguments(options, base):
     return argv
 
 
-def load_suite(path):
-    """Expand an entire suite before creating output or running any experiments."""
+def read_suite(path):
+    """Read and validate the file envelope without resolving inputs or sources."""
     path = path.expanduser().resolve()
     try:
         raw = path.read_text()
@@ -178,19 +194,35 @@ def load_suite(path):
     unknown = set(document) - {
         "schema_version",
         "vars",
+        "inputs",
         "defaults",
         "runs",
         "output_root",
+        "data_assets",
+        "publish",
     }
     if unknown:
         raise ValueError(f"unknown experiment file fields: {sorted(unknown)}")
-    document = expand_variables(
-        document, datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")
+    return raw, document
+
+
+def load_suite(path, assignments=(), interactive=False):
+    """Resolve typed inputs and expand the suite before any external side effects."""
+    path = path.expanduser().resolve()
+    raw, document = read_suite(path)
+    input_values, cli_overrides = resolve_inputs(
+        document, assignments, interactive=interactive
     )
-    defaults = merge_options({}, document.get("defaults", {}))
+    document = expand_variables(
+        document, datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f"), input_values
+    )
+    assets = plan_assets(document.get("data_assets"), path.parent)
+    resolutions = {}
+    defaults = merge_options({}, document.get("defaults", {}), resolutions)
     runs = document.get("runs")
     if not isinstance(runs, dict) or not runs:
         raise ValueError("runs must be a nonempty mapping of run names to options")
+    publishing.configuration(document.get("publish"), runs)
     output = document.get("output_root")
     if not isinstance(output, str) or not output:
         raise ValueError("output_root must be a path")
@@ -203,7 +235,7 @@ def load_suite(path):
     for name, overrides in runs.items():
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", name):
             raise ValueError(f"invalid run name: {name!r}")
-        options = merge_options(defaults, overrides)
+        options = merge_options(defaults, overrides, resolutions)
         options.setdefault("label", name)
         argv = arguments(options, path.parent)
         destination = output / name
@@ -217,17 +249,48 @@ def load_suite(path):
     return {
         "source_file": str(path),
         "original_yaml": raw,
+        "cli_overrides": cli_overrides,
+        "input_values": input_values,
         "configuration": document,
         "output_root": str(output),
         "runs": plan,
+        "data_assets": assets,
+        "source_resolutions": list(resolutions.values()),
     }
 
 
-def run_suite(path, invoke, validate_only=False):
+def run_suite(
+    path,
+    invoke,
+    validate_only=False,
+    prepare_only=False,
+    assignments=(),
+    interactive=False,
+    publish_dry_run=False,
+):
     """Preflight every run, execute serially, and preserve partial failure reports."""
-    plan = load_suite(path)
+    plan = load_suite(path, assignments=assignments, interactive=interactive)
+    if plan["input_values"]:
+        print(
+            "Selected inputs: "
+            + ", ".join(f"{k}={v}" for k, v in plan["input_values"].items()),
+            flush=True,
+        )
     root = Path(plan["output_root"])
-    # Validation uses the same CLI checks as individual runs and creates nothing.
+    publish_config = publishing.configuration(
+        plan["configuration"].get("publish"), [r["name"] for r in plan["runs"]]
+    )
+    if publish_config and not (validate_only or prepare_only or publish_dry_run):
+        plan["publication_pr"] = publishing.preflight(publish_config)
+    if not validate_only:
+        if plan["data_assets"]:
+            print("Preparing input data (checking shared cache)…", flush=True)
+        prepare_assets(plan["data_assets"])
+    if prepare_only:
+        print(f"Prepared {len(plan['data_assets'])} assets; no experiments started")
+        return 0
+    # Validation uses the same CLI checks as individual runs. Input preparation
+    # above runs only for execution/prepare; validate itself creates nothing.
     # Run it for the whole suite first, so a typo in run two cannot waste run one.
     for run in plan["runs"]:
         with redirect_stdout(io.StringIO()):
@@ -241,9 +304,12 @@ def run_suite(path, invoke, validate_only=False):
     (root / "experiments.yaml").write_text(plan["original_yaml"])
     write_json(root / "suite.json", plan)
     completed = []
+    failed = False
     try:
-        for run in plan["runs"]:
-            print(f"Running experiment {run['name']}…", flush=True)
+        for number, run in enumerate(plan["runs"], 1):
+            print(
+                f"Experiment {number}/{len(plan['runs'])}: {run['name']}…", flush=True
+            )
             try:
                 code = invoke(["run", *run["argv"]])
             finally:
@@ -252,9 +318,21 @@ def run_suite(path, invoke, validate_only=False):
                 if (Path(run["output_dir"]) / "experiment.json").is_file():
                     completed.append(Path(run["output_dir"]))
             if code:
+                failed = True
                 return code
+    except BaseException:
+        failed = True
+        raise
     finally:
         if completed:
             report(completed, root / "comparison.html")
             print(f"Comparison: {root / 'comparison.html'}", flush=True)
+        if publish_config:
+            try:
+                publishing.publish(root, dry_run=publish_dry_run)
+            except (ValueError, OSError) as error:
+                if not failed:
+                    raise
+                # Keep the model failure primary, but never hide a posting failure.
+                print(f"Publication failed: {error}", flush=True)
     return 0

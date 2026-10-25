@@ -1,5 +1,19 @@
 # Run from any directory: abench /path/to/abench/examples/sandag-chunked.yaml
 schema_version: 1
+inputs:
+  households:
+    type: integer
+    default: 28365
+    minimum: 0
+    description: Households to sample from benchmarking-data; 0 uses all
+  processes:
+    type: integer
+    default: 4
+    minimum: 1
+  warmup_households:
+    type: integer
+    default: 5000
+    minimum: 1
 vars:
   model: ../../sandag-abm3-example
   activitysim_main: 5c6fae24a91a57a2d6dfc2e1dbe062a61d94545a
@@ -11,9 +25,11 @@ defaults:
   data_dir: ${model}/benchmarking-data
   config_overlay: ["${model}/configs_explicit_chunk"]
   multiprocess: true
-  processes: 4
+  processes: ${processes}
   sharrow: true
-  households: 28365
+  households: ${households}
+  # Cache misses in the measured run trigger a retry using the compiled flows.
+  warmup_households: ${warmup_households}
   memory: 80g
   shm_size: 8g
   platform: linux/arm64

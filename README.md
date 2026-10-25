@@ -4,8 +4,21 @@ Run reproducible ActivitySim runtime and memory experiments in Linux Docker,
 from macOS or Linux. One runner supports MTC, SANDAG ABM3, and other models through
 small YAML profiles. ActivitySim itself does not need to be installed on the host.
 
+With [uv](https://docs.astral.sh/uv/), run without managing a Python environment:
+
 ```bash
-python -m pip install /path/to/abench
+uvx abench --help
+uvx abench experiments.yaml
+```
+
+For a specific release use `uvx abench@0.1.2 experiments.yaml`; use
+`uvx abench@latest` to refresh to the latest release. Docker and model data must
+still be available locally. macOS and Linux hosts are supported.
+
+Alternatively, install with pip:
+
+```bash
+python -m pip install abench
 abench run --model-dir /path/to/sandag-abm3-example --profile sandag \
   --source activitysim=ActivitySim/activitysim@<full-40-character-SHA> \
   --source sharrow=ActivitySim/sharrow@<full-40-character-SHA> \
@@ -35,10 +48,44 @@ does not require a GitHub Actions workflow.
 
 ## Named experiment files
 
+You can pass a model directory instead of a YAML file:
+
+```bash
+abench /path/to/model
+```
+
+Abench looks for `.yaml` and `.yml` files directly inside `/path/to/model/.abench/`
+(no recursive search). In a terminal it lists them alphabetically and asks which
+experiment to run, then prompts for that experiment's inputs. Use ↑/↓ to move the highlighted selection and Enter to confirm. The first file
+is initially selected; a single file still gets a selection prompt. Only the selected file
+is loaded. `run`, `validate`, and `prepare` all support directory selection.
+
+`abench /path/to/model --help` lists available files without prompting or running
+anything. Missing `.abench` directories and empty file lists produce clear errors.
+Without a terminal, or with `--non-interactive`, one file is selected automatically;
+multiple files require passing the desired YAML path directly.
+
+Relative paths remain relative to the selected YAML file. For a file inside
+`.abench`, use `model_dir: ..` and, for example, `data_dir: ../data_full` and
+`output_root: ../benchmark-runs/run-${timestamp}` to reference the parent model.
+For declared downloads, keep unpack destinations inside `.abench` (for example,
+`unpack: data_full` with `data_dir: data_full`); asset destinations cannot use `..`.
+Moving an existing suite into `.abench` requires reviewing its paths.
+
+
 Write common options once and override only what differs between runs:
 
 ```yaml
 schema_version: 1
+inputs:
+  households:
+    type: integer
+    default: 28365
+    minimum: 0
+  warmup_households:
+    type: integer
+    default: 5000
+    minimum: 1
 vars:
   model: /path/to/sandag-abm3-example
 output_root: ./results/sandag-${timestamp}
@@ -50,7 +97,8 @@ defaults:
   multiprocess: true
   processes: 4
   sharrow: true
-  households: 28365
+  households: ${households}
+  warmup_households: ${warmup_households}
   memory: 80g
   shm_size: 8g
   sources:
@@ -77,14 +125,135 @@ in the repository. Its paths assume abench and the SANDAG repository are sibling
 The pinned `main` revision is the one used in the earlier trials, not a moving
 branch reference.
 
+To compare **current main against a PR**, named suites also accept source mappings
+with `branch` or `pr` in place of `commit`:
+
+```yaml
+schema_version: 1
+inputs:
+  activitysim_pr:
+    type: integer
+    required: true
+    minimum: 1
+    description: ActivitySim PR number to compare against current main
+output_root: benchmark-runs/mtc-${timestamp}
+defaults:
+  profile: mtc
+  households: 500000
+  multiprocess: true
+  processes: 4
+  sharrow: true
+  sources:
+    - sharrow=ActivitySim/sharrow@fc175b27d8e0c5d202721c67d96b050e6117b235
+runs:
+  main:
+    sources:
+      - name: activitysim
+        repository: ActivitySim/activitysim
+        branch: main
+  pr:
+    label: ActivitySim PR ${activitysim_pr}
+    sources:
+      - name: activitysim
+        repository: ActivitySim/activitysim
+        pr: ${activitysim_pr}
+```
+
+Each mapping must provide exactly one of `commit`, `branch`, or `pr`. Branch/PR
+selectors work for any source package in a suite, including extras/subdirectories.
+Abench uses host Git and network access to resolve each selector once per suite,
+before running models, and passes only exact commits to the builds. `pr` selects
+`refs/pull/<number>/head` in the named repository, including PRs from forks;
+it does **not** select the synthetic merge commit. Use a positive integer PR number.
+`branch` names the branch without `refs/heads/`.
+
+The resolved commits are printed and recorded in `suite.json` alongside the
+original YAML, and in each experiment's source provenance. A new invocation
+resolves the selectors again, including `validate` and `prepare`. To reproduce an
+earlier suite, replace selectors with `commit: <recorded-full-SHA>`. CLI overrides
+and model profiles still require exact commits.
+
+Start the suite and answer its input prompts:
+
+```bash
+uvx abench ./activitysim-prototype-mtc/abench.yaml
+# Preflight the same selection without running benchmarks:
+uvx abench validate ./activitysim-prototype-mtc/abench.yaml
+```
+
+Declare user-facing settings in `inputs`, and keep internal reusable values and
+expressions in `vars`. Only inputs can be overridden. For example:
+
+```yaml
+inputs:
+  households:
+    type: integer
+    default: 500000
+    minimum: 0
+    description: Households to sample; 0 uses the full population
+  mode:
+    type: string
+    default: chunked
+    choices: [chunked, unchunked]
+  sharrow:
+    type: boolean
+    default: true
+vars:
+  label: "${mode}, ${households} households"
+```
+
+In a terminal, run, validate, and prepare prompt for each input in YAML order.
+Inputs with `choices` use the same arrow-key menu, with the declared default
+initially highlighted (or the first option if required). Enter confirms the
+selection and preserves its declared type. Other inputs use text prompts.
+Press Enter to accept a displayed default. Required text inputs have no default and
+must be entered; empty or invalid answers prompt again with an explanation.
+Ctrl-C cancels before source resolution or downloads. Selected values are printed
+and saved in `suite.json` as `input_values`.
+
+For scripting, `--non-interactive` uses defaults and supplied values without
+prompting. Non-terminal stdin behaves the same way; missing required inputs fail
+instead of hanging. Repeatable `--set NAME=VALUE` can supply values explicitly;
+these inputs are not prompted. Quote
+arguments containing spaces, for example `--set 'label=My experiment'` if `label`
+is declared as a string input. `abench experiment.yaml --help` lists the file's
+inputs, descriptions, defaults, and constraints without requiring input values,
+contacting GitHub, downloading data, or creating outputs.
+
+- Every input requires a `type`: `string`, `integer`, `number`, or `boolean`.
+  Give it either a typed YAML `default` or `required: true`, but not both.
+- Optional `choices` restricts allowed values; `minimum`/`maximum` are inclusive
+  bounds for numeric inputs. Numbers must be finite. Boolean overrides accept
+  `true` or `false` (case insensitive), not `yes`, `no`, `1`, or `0`.
+- Values are converted according to their declared type, never parsed as YAML.
+  Strings retain literal text, including `=`, spaces, and `${...}`. Defaults and
+  input declarations are literal too; use `vars` for derived expressions.
+- Defaults are applied first, followed by command-line overrides, then `${...}`
+  expansion. Inputs and vars share one namespace; duplicate names and the
+  reserved name `timestamp` are errors. Input names use letters, digits, and
+  underscores and cannot start with a digit.
+- Unknown inputs, duplicate overrides, and invalid explicit values fail before
+  source resolution or downloads. Missing required inputs prompt in a terminal
+  and fail in non-interactive mode. There is no overriding vars.
+- The YAML file is unchanged. `suite.json` records typed `cli_overrides`, effective
+  `input_values`, the expanded configuration, and exact source resolutions.
+  `experiments.yaml` preserves the original file, so replay its recorded overrides
+  too when reproducing a run.
+
+`branch: main` is freshly resolved on **every launch**; there is no saved branch
+SHA to update manually. For the MTC example, enter the PR number when prompted,
+then press Enter twice to accept 500,000 households and 4 processes.
+
+These features are available in abench 0.1.1 and later.
+
 - `defaults` accepts CLI options using underscores (`shm_size`, `config_overlay`,
   etc.). Use `multiprocess: false` for serial execution and `sharrow: false` to
   disable Sharrow. `sources` accepts the same strings/mappings as model profiles.
 - `runs` is an ordered mapping of names to overrides. Each run inherits defaults;
   ordinary values and lists are replaced. **Sources merge by normalized package
   name**, so changing ActivitySim does not discard the shared Sharrow pin.
-- `${name}` substitutes a reusable scalar from `vars`; terms can reference other
-  terms. A whole-value reference preserves its type, including numbers/booleans.
+- `${name}` substitutes a scalar from `inputs` or `vars`; vars can reference
+  other vars and inputs. A whole-value reference preserves its type, including numbers/booleans.
   Undefined references and cycles are errors. No shell or environment expansion
   is performed. `${timestamp}` is a built-in UTC launch identifier shared by all
   runs, with microseconds to avoid reusing output directories.
@@ -99,14 +268,126 @@ branch reference.
   order. Failure stops the suite and retains partial results. The combined report
   is `output_root/comparison.html`; individual runs retain their own reports.
   `experiments.yaml` and `suite.json` record the original file and expanded plan.
-- File invocations do not accept additional CLI overrides. Edit `defaults` or the
-  relevant run to keep the file a complete description of the experiment.
+- File invocations accept `--set` and `--non-interactive`; other model options belong
+  in `defaults` or the relevant run.
 
 This experiment file describes **which tests to run**. A model profile such as
 `benchmark.yaml` describes **how to configure a model**, and remains reusable
 across suites.
 
+Terminal progress identifies the experiment number, image build, warmup, and
+measured attempts/retries. During builds and model phases, an interactive terminal
+shows live elapsed time, current and peak cgroup memory (when available), and a
+panel with the last 12 lines of the run log. Ctrl-C cancels the command. Full
+console output stays in the printed log paths; elapsed time and memory status
+are saved every 15 seconds in a sibling `console.progress.log` (or
+`build.progress.log` for builds). Redirected output and non-interactive terminals
+only print start and finish summaries. These are status updates, not an estimated
+completion percentage.
+
+## Publishing benchmark results to a PR
+
+A suite can post one results comment after its final comparison report. Add an
+explicit target (the repository is always on github.com):
+
+```yaml
+inputs:
+  pr:
+    type: integer
+    required: true
+    minimum: 1
+publish:
+  github:
+    repository: ActivitySim/activitysim
+    pr: ${pr}
+    baseline: main
+```
+
+`baseline` names a run in `runs` and defaults to the first run. The posting target
+is independent of source selection: use `pr: ${pr}` in an ActivitySim source
+mapping to benchmark that PR's pinned head as well. See
+[`examples/sandag-pr.yaml`](examples/sandag-pr.yaml) for a complete example with a
+pinned baseline; adjust its model/data paths and baseline commit for your model.
+
+```bash
+abench examples/sandag-pr.yaml --set pr=1110
+# Run benchmarks, but only generate the local comment and charts:
+abench examples/sandag-pr.yaml --set pr=1110 --publish-dry-run
+# Inspect or publish retained results without rerunning benchmarks:
+abench publish /path/to/suite-output --dry-run
+abench publish /path/to/suite-output
+# Read local status, or verify the comment still exists on GitHub:
+abench publish /path/to/suite-output --status
+abench publish /path/to/suite-output --verify
+# The permanent launcher works from any working directory:
+/path/to/suite-output/publication/publish.sh
+/path/to/suite-output/publication/publish.sh --dry-run
+```
+
+Publication requires GitHub CLI 2.99 or newer with `gh pr comment --attach`, an
+authenticated account, and repository write access for image uploads. Use
+`gh auth login --hostname github.com` (OAuth), or a classic personal access token
+through `GH_TOKEN`. Other token types and GitHub Enterprise Server image uploads
+are not supported by this first release. `gh` remains optional for ordinary runs
+and publication dry runs. Authentication and PR access are checked before asset
+preparation or benchmark execution when publication is enabled; validation and
+prepare-only commands do not publish. Tokens are never written to experiment
+metadata or passed into benchmark containers.
+
+The comment contains elapsed time and peak memory, percentage changes against the
+baseline for valid runs with matching comparison settings, run settings, source
+commits, memory traces, and component-runtime charts. Invalid runs have no change
+claims and are excluded from the runtime chart; unstarted runs are identified.
+PR head/base commits are recorded at startup, and a head change during execution
+is noted when posting. These are observations, not statistical significance tests.
+
+The `publication/` directory retains `comment.md`, `memory.svg`, `runtimes.svg`,
+and `state.json` with the comment ID/URL and publication status. `STATUS.md` shows
+whether publication is pending, failed, uncertain, or published, with attempt time,
+errors, a retry command, and the comment link. It reflects local knowledge;
+`--verify` checks GitHub without uploading or editing anything. Verification
+failures preserve the previous publication record. A missing previously published
+comment is flagged and is not automatically recreated.
+
+The executable `publish.sh` is permanent: it is safe to call repeatedly and passes
+through `--dry-run`, `--status`, or `--verify`. It prefers `abench` on PATH, then
+uses `uvx --refresh --from <recorded-checkout>` when a development checkout was
+available when the bundle was prepared. It reports an actionable error if neither
+is available and never stores credentials. Output paths with spaces are supported.
+Existing suites can create these helpers with `abench publish OUTPUT --status`
+without reading measurement data or contacting GitHub.
+
+The final console message explicitly says whether results were published, gives
+the comment URL on success, or gives the launcher command when action is needed.
+A connection failure after posting begins is marked as an uncertain outcome;
+retrying reconciles the comment marker before attempting another post.
+
+The exact upload body is retained as `upload.md`. A retry searches for the suite's
+unique comment
+marker before posting; a recorded successful publication is a no-op. Independent
+suite executions get separate comments. Simultaneous publication of the same
+output directory is blocked. Partial uploads can leave unused GitHub attachments,
+but the local reports are retained and a retry can complete the comment.
+
+A posting error fails the command and prints the retry command. If the benchmark
+also failed, its failure remains primary and the publication error is printed
+separately. The full HTML/JSON comparison remains local; this release uploads only
+the summary and SVG figures, not raw logs, model data, or the interactive HTML.
+Images must fit GitHub's 10 MB attachment limit, and summaries are limited to
+60,000 characters. Publication transport tests simulate GitHub; a live attachment
+smoke test should use a designated test PR, never a production PR by default.
+
 ## Run controls
+
+On macOS, benchmark commands automatically run `/usr/bin/caffeinate -i` to prevent
+idle system sleep for the entire invocation, including preparation, builds,
+warmup, measured attempts, reporting, and PR publication. The display can still
+sleep. The assertion is released on completion or cancellation; it also expires
+if the abench process exits unexpectedly. Other platforms are unchanged.
+Use `--allow-sleep` to opt out, for example `abench experiments.yaml --allow-sleep`.
+Report-only, publish-only, validation, preparation-only, and help commands do not
+start caffeinate. This prevents idle sleep; it does not override explicit sleep
+or closing a laptop lid.
 
 - `--single-process` (default), or `--multiprocess --processes N`. The count applies
   to every sliced stage; coordinators are additional processes.
@@ -117,8 +398,8 @@ across suites.
   priority order. Relative overlay paths are relative to the model directory.
 - `--memory 16g`, `--shm-size 8g`, `--interval 0.5`, and optional `--platform`.
 - `--output-dir` must be new. `--label` names an experiment, and `--compare` accepts
-  earlier experiment directories. `--cache-from` seeds compatible generated flows;
-  a complete warmup still runs.
+  earlier experiment directories. Compatible compiled flows are reused automatically;
+  the serial warmup still runs.
 
 `abench validate` accepts the same experiment arguments without `--output-dir`.
 It checks the profile, required inputs, CSV population size, source pin syntax,
@@ -237,11 +518,65 @@ model outputs.
 
 ## Measurement and reports
 
-Sharrow runs first complete a full matching warmup in a separate container. The
-measured run uses the same sample, seed, layout, and cache path. Numba compilation
-of generated flow overloads is rejected during measurement; ordinary non-flow
-compilation and disk-cache loading remain included. This guard uses private
-Numba internals and is covered by real disk-cache hit/miss tests.
+Sharrow runs first execute the model in a separate **single-process** warmup,
+using **min(target households, 5000)** households by default. For `--households 0`,
+the target is the full available population, so warmup uses at most 5000 of those
+households. Set `--warmup-households N` (or `warmup_households: N` in experiment
+YAML) to change this positive cap. Warmup always uses one process; measured runs
+retain their requested sample and worker count. Model config directories, seed,
+chunk overlays, and flow cache path are retained from the target experiment.
+
+Compiled flows are automatically reused across runs and suites, including changes
+in ActivitySim revisions, sample sizes, process counts, and model configs. The
+persistent host cache defaults to `~/.cache/abench/flows`. Change it with
+`--flow-cache-dir PATH` (`flow_cache_dir` in YAML), or disable automatic reads and
+writes with `--no-reuse-flows` (`reuse_flows: false`). `--cache-from` remains an
+explicit seed option with its existing stricter dependency checks.
+
+Containers set `NUMBA_CACHE_DIR` to `/results/cache/flows/.numba`, a writable
+directory included in those snapshots. This covers installed-library helpers
+(such as `sharrow.maths`) as well as generated flows without writing into
+root-owned site-packages or relying on the container user's home directory.
+Warmup may recompile entries from older snapshots that used Numba's default paths.
+
+Compatibility uses the **installed** Sharrow, Numba, llvmlite, and NumPy versions,
+plus their source repository/commit identities when applicable, Python version,
+and container architecture/CPU features. ActivitySim and model settings are
+excluded from this key: Sharrow identifies generated flows by their contents,
+and Numba checks cached signatures. Changed flows can compile during warmup.
+An existing cache does **not** guarantee that warmup will need no compilation.
+
+Each experiment receives a private copy with source timestamps preserved. Warmup
+always runs, and successful warmups atomically update the persistent cache before
+measurement starts. Compatible simultaneous experiments wait for each other to avoid losing
+compiled signatures when attempts update Numba cache indexes. Only `cache/flows`
+is shared, never model data, outputs, or shared-memory artifacts. Cache identity
+and reuse counts are recorded in `flow-cache-identity.json` and `experiment.json`.
+The persistent cache can be deleted between runs to reclaim disk space; older
+experiments created before this feature are not automatically imported.
+
+A smaller serial warmup may not exercise every flow/type signature needed by the
+measured run. Each measured attempt therefore records flow compilation and allows
+it to finish. If compilation occurred, the completed attempt becomes **cache
+preparation**, and none of its runtime or memory results qualify as benchmark
+results. Its diagnostics and outputs are retained under `attempts/attempt-001`,
+`attempts/attempt-002`, etc. Newly compiled flows are published to the shared cache.
+
+The model then restarts in a fresh container with fresh outputs and model caches,
+using the same settings and expanded flow cache. Only an attempt with **zero flow
+compilations** is accepted. All attempts keep permanent directories under
+`attempts/`; `measured/` links to the accepted attempt. By default abench allows
+**two additional attempts** (three total). Set `--cache-retries N` or
+`cache_retries: N` in YAML; zero allows no retries. If compilation persists, the
+experiment fails with the final attempt's diagnostics retained. Ordinary model
+errors, OOMs, and output validation failures stop immediately and are never
+retried as cache preparation.
+
+The report and `experiment.json` include attempt history. Each attempt retains
+`cache-miss-details-*.jsonl`, its settings, component timings, and memory samples.
+Ordinary non-flow compilation and disk-cache loading remain included in accepted
+measurements. Flow tracking uses private Numba internals and is covered by real
+compilation, cache-hit, and Docker retry tests.
 
 Memory is the whole-container cgroup v2 charge, counting shared pages once.
 Blue is `memory.current` (including file cache, shared memory, and kernel costs).
@@ -315,3 +650,52 @@ and reports. They do not require either example repository or large datasets.
 Adapted from the MTC and SANDAG benchmark harnesses developed in this workspace.
 The original measurement approach was informed by WSP's Lighthouse production
 benchmark. See LICENSE for the retained BSD license.
+
+## Releases
+
+See [RELEASING.md](https://github.com/ActivitySim/abench/blob/main/RELEASING.md)
+for Trusted Publishing setup and release instructions.
+
+## Downloading model data
+
+Experiment suites may declare `data_assets` using ActivitySim's external-example
+asset names, URLs, SHA-256 checksums, and `unpack` destinations:
+
+```yaml
+data_assets:
+  name: prototype_mtc_extended
+  assets:
+    data_full.tar.zst:
+      url: https://github.com/ActivitySim/activitysim-prototype-mtc/releases/download/v1.3.4/data_full.tar.zst
+      sha256: b402506a61055e2d38621416dd9a5c7e3cf7517c0a9ae5869f6d760c03284ef3
+      unpack: data_full
+```
+
+`abench experiment.yaml` prepares these assets before validating model inputs or
+starting Docker. `abench prepare experiment.yaml` only prepares data. `abench
+validate experiment.yaml` remains read-only: it checks declarations and requires
+inputs to be present (use `prepare` first for a fresh clone). Asset destinations
+are relative to the experiment YAML, regardless of `model_dir`; point each run's
+`data_dir` to the appropriate destination. Variable substitutions also work here.
+
+The default download cache is exactly
+`platformdirs.user_cache_dir("ActivitySim")/External-Examples/<name>/`—the same
+layout used by `activitysim.examples.external.download_external_example`.
+`name` is optional; `cache_dir` can override the root before appending `name`.
+Keep names and checksums identical to ActivitySim's declarations to share files.
+For assets cached by direct `download_asset(link=True)` calls, set `cache_dir`
+to that call's `platformdirs.user_data_dir("ActivitySim")` and omit `name`.
+No host ActivitySim installation is needed.
+
+Checksums are required and verified before reuse. For a `.gz` URL whose asset name
+omits `.gz`, the checksum covers the decompressed file, as in ActivitySim.
+Archives (`.tar.zst`, `.tar.gz`, `.zip`) use the archive checksum and preserve their
+internal paths when unpacking. Verified extracted contents are cached under
+`.abench-extracted/<sha256>/` beside the archive. Whole unpacked directories are
+linked to the suite, and abench resolves `data_dir` before Docker mounts it.
+Individual files are copied so external file symlinks cannot break inside Docker.
+Existing destinations must match; modified inputs are never silently replaced.
+Archive links, special files, and paths escaping the destination are rejected.
+The original instructions and resolved cache locations are saved in `suite.json`.
+
+Data preparation is available in abench 0.1.1 and later.

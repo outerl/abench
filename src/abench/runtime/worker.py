@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -17,6 +18,57 @@ if os.environ.get("BENCH_MODEL") == "1":
 
 def write_json(path, value):
     path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def phase_spec(spec, phase_name, data_root=Path("/data")):
+    """Shrink only warmup; retain target config selection and the measured spec."""
+    result = dict(spec)
+    if phase_name != "warmup":
+        return result
+    cap = spec.get("warmup_households", 5000)
+    target = spec["households"]
+    if target == 0:
+        # Zero denotes the full population, not an empty sample. Count only as
+        # far as the cap for CSV, or use Parquet metadata without loading rows.
+        profile = spec["profile"]
+        filename = profile.get("household_table")
+        if filename is None:
+            stem = (
+                profile.get("input_tables", {})
+                .get("households", {})
+                .get("file", "households")
+            )
+            filename = stem + ".csv"
+        path = data_root / filename
+        if not path.exists() and path.suffix == ".csv":
+            path = path.with_suffix(".parquet")
+        if path.suffix == ".csv" and path.is_file():
+            with path.open(newline="") as stream:
+                reader = csv.reader(stream)
+                next(reader, None)
+                target = 0
+                for row in reader:
+                    if row:
+                        target += 1
+                        if target >= cap:
+                            break
+        elif path.suffix == ".parquet" and path.is_file():
+            import pyarrow.parquet as pq
+
+            target = pq.ParquetFile(path).metadata.num_rows
+        else:
+            raise ValueError(
+                "Cannot determine full-population warmup size; configure household_table or set a positive --households target"
+            )
+        if target < 1:
+            raise ValueError("Cannot build a flow cache from an empty household table")
+    result.update(
+        households=min(target, cap),
+        multiprocess=False,
+        processes=1,
+        _target_multiprocess=spec["multiprocess"],
+    )
+    return result
 
 
 def make_state(
@@ -39,6 +91,7 @@ def make_state(
     from activitysim.core.workflow import State
 
     profile = spec["profile"]
+    config_multiprocess = spec.get("_target_multiprocess", spec["multiprocess"])
     defaults = dict(profile.get("settings", {}))
     if spec["sharrow"]:
         defaults.update(profile.get("sharrow_settings", {}))
@@ -49,7 +102,7 @@ def make_state(
             for name in base["models"]
             if name not in profile.get("exclude_models", [])
         ]
-    if spec["multiprocess"] and profile.get("mp_settings"):
+    if config_multiprocess and profile.get("mp_settings"):
         mp = yaml.safe_load((model_root / profile["mp_settings"]).read_text())
         defaults["multiprocess_steps"] = mp["multiprocess_steps"]
     generated = phase / "profile-config"
@@ -62,7 +115,7 @@ def make_state(
         model_root / f"overlay-{i}" for i in range(len(spec.get("config_overlay", [])))
     ]
     configs += [generated]
-    if spec["multiprocess"]:
+    if config_multiprocess:
         configs += [model_root / name for name in profile.get("mp_configs", [])]
     configs += [model_root / name for name in profile["configs"]]
     overrides = dict(
@@ -111,7 +164,12 @@ def make_state(
 
 
 def run_model(spec, phase):
-    """Use identical samples, process layout and cache paths in both phases."""
+    """Warm flows with a small serial run; measure the untouched target settings."""
+    spec = phase_spec(spec, os.environ.get("BENCH_PHASE_NAME", phase.name))
+    write_json(
+        phase / "phase-settings.json",
+        {key: spec[key] for key in ("households", "multiprocess", "processes")},
+    )
     state = make_state(spec, phase)
     state.logging.config_logger()
     write_json(
@@ -210,9 +268,21 @@ def supervise(spec, phase):
     (phase / "output").mkdir()
     for name in ("flows", "model"):
         Path(f"/results/cache/{name}").mkdir(parents=True, exist_ok=True)
+    # Fail before running models if the configured compilation cache is unusable.
+    numba_cache = Path(os.environ["NUMBA_CACHE_DIR"])
+    try:
+        numba_cache.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryFile(dir=numba_cache):
+            pass
+    except OSError as error:
+        raise RuntimeError(f"Numba cache is not writable: {numba_cache}") from error
     env = dict(os.environ, BENCH_MODEL="1", BENCH_PHASE_DIR=str(phase))
-    env["BENCH_STRICT_CACHE"] = (
-        "1" if spec["sharrow"] and phase.name == "measured" else "0"
+    env["BENCH_STRICT_CACHE"] = "0"
+    env["BENCH_TRACK_CACHE"] = (
+        "1"
+        if spec["sharrow"]
+        and os.environ.get("BENCH_PHASE_NAME", phase.name) == "measured"
+        else "0"
     )
     started = time.perf_counter()
     env["BENCH_STARTED_MONOTONIC"] = str(started)
@@ -247,7 +317,9 @@ def supervise(spec, phase):
 if __name__ == "__main__":
     mode, phase_arg = sys.argv[1:]
     phase = Path(phase_arg)
-    spec = json.loads(Path("/results/experiment.json").read_text())
+    spec = json.loads(
+        Path(os.environ.get("BENCH_SPEC_PATH", "/results/experiment.json")).read_text()
+    )
     if mode == "model":
         run_model(spec, phase)
     elif mode == "summary":

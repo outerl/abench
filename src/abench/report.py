@@ -8,6 +8,7 @@ import re
 import statistics
 
 from .common import read_json, write_json
+from .failures import describe_failure
 
 COLORS = ("#0072b2", "#d55e00", "#009e73", "#cc79a7", "#e69f00", "#56b4e9")
 
@@ -96,12 +97,12 @@ def component_windows(observations, phase):
     return windows
 
 
-def load_run(directory):
+def load_run(directory, *, allow_cache_misses=False):
     """Use raw worker observations, never duplicate ActivitySim's locutor CSV."""
     spec = read_json(directory / "experiment.json")
     if not spec or spec.get("schema_version") not in (1, 2):
         raise ValueError(f"Not a supported benchmark experiment: {directory}")
-    phase = directory / "measured"
+    phase = directory / spec.get("measured_directory", "measured")
     grouped = {}
     observations = []
     for path in sorted(phase.glob("components-*.jsonl")):
@@ -136,13 +137,22 @@ def load_run(directory):
     )
     valid = (
         sample_matches
+        and not spec.get("failure")
         and status.get("returncode") == 0
         and docker.get("ExitCode") == 0
         and bool(memory)
         and bool(components)
         and not docker.get("OOMKilled")
-        and not list(phase.glob("cache-miss-*.txt"))
+        and (allow_cache_misses or not list(phase.glob("cache-miss-*.txt")))
     )
+    warmup_settings = read_json(directory / "warmup/phase-settings.json", {})
+    effective = read_json(directory / "warmup/effective-settings.json", {})
+    if effective:
+        warmup_settings = {
+            "households": effective.get("households_sample_size"),
+            "multiprocess": effective.get("multiprocess"),
+            "processes": effective.get("num_processes"),
+        }
     return {
         "spec": spec,
         "components": components,
@@ -153,6 +163,15 @@ def load_run(directory):
         "inputs": read_json(phase / "input-summary.json", {}),
         "outputs": outputs,
         "component_summaries": component_summaries,
+        "failure_reason": (
+            spec.get("failure", {}).get("error")
+            or describe_failure(
+                directory, spec.get("failure", {}).get("phase", "measured")
+            )
+        )
+        if not valid
+        else None,
+        "warmup_settings": warmup_settings,
         "peak": max((r["peak_bytes"] for r in memory), default=0),
         "docker": docker,
         "path": str(directory),
@@ -459,6 +478,8 @@ def experiment_card(run, xmax, ymax):
             "sharrow",
             "use_explicit_error_terms",
             "households",
+            "warmup_households",
+            "cache_retries",
             "data_dir",
             "output_dir",
             "memory",
@@ -468,6 +489,9 @@ def experiment_card(run, xmax, ymax):
             "compare",
             "config_overlay",
             "cache_from",
+            "reuse_flows",
+            "flow_cache_dir",
+            "flow_cache",
         )
     )
     counts = []
@@ -497,11 +521,34 @@ def experiment_card(run, xmax, ymax):
     counts.append(f"<tr><th>TAZs</th>{taz_cells}</tr>")
     elapsed = run["status"].get("elapsed_seconds")
     elapsed = f"{elapsed:.3f}" if elapsed is not None else "unavailable"
-    failure = f"<p>{escape(spec['failure'])}</p>" if spec.get("failure") else ""
+    failure = (
+        f"<pre>{escape(run['failure_reason'])}</pre>"
+        if run.get("failure_reason")
+        else ""
+    )
+    attempts = spec.get("attempts", [])
+    attempt_table = ""
+    if attempts:
+        rows = "".join(
+            "<tr>"
+            + "".join(
+                f"<td>{escape(attempt.get(key, '—'))}</td>"
+                for key in ("number", "status", "compilations", "directory")
+            )
+            + "</tr>"
+            for attempt in attempts
+        )
+        attempt_table = (
+            "<h3>Attempt history</h3><p>Cache-preparation attempts are excluded from benchmark results.</p>"
+            "<table><tr><th>Attempt</th><th>Result</th><th>Flow compilations</th><th>Artifacts</th></tr>"
+            + rows
+            + "</table>"
+        )
     details = "".join(
         f"<details><summary>{title}</summary><pre>{escape(json.dumps(value, indent=2))}</pre></details>"
         for title, value in (
             ("Complete settings and provenance", spec),
+            ("Actual cache-build settings", run.get("warmup_settings", {})),
             ("Input totals and categories", run["inputs"]),
             ("Output totals and categories", run["outputs"]),
             ("Component outcome summaries", run["component_summaries"]),
@@ -510,7 +557,7 @@ def experiment_card(run, xmax, ymax):
     )
     return (
         f"<article><h2>{escape(spec['label'])}</h2><p><b>{'SUCCEEDED' if run['valid'] else 'FAILED / INCOMPLETE'}</b>"
-        f" · elapsed: {elapsed} s · peak: {run['peak'] / 2**30:.3f} GiB</p>{failure}"
+        f" · elapsed: {elapsed} s · peak: {run['peak'] / 2**30:.3f} GiB</p>{failure}{attempt_table}"
         f"{memory_chart(run, xmax, ymax)}<h3>Experiment settings</h3><table>{settings}</table>"
         f"<h3>Population and outputs</h3><table><tr><th>Table</th><th>Input rows</th><th>Output rows</th></tr>{''.join(counts)}</table>"
         f"<p>Output households and persons are the realized sample.</p>{details}</article>"

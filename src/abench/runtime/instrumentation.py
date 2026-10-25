@@ -1,4 +1,4 @@
-"""Process-local component timing and a strict Sharrow disk-cache guard."""
+"""Process-local component timing and Sharrow compilation tracking."""
 
 import json
 import multiprocessing
@@ -42,7 +42,10 @@ def install(flow_cache=Path("/results/cache/flows")):
                 stream.write(json.dumps(row) + "\n")
 
     runner.run_named_step = timed
-    if os.environ.get("BENCH_STRICT_CACHE") == "1":
+    if (
+        os.environ.get("BENCH_TRACK_CACHE") == "1"
+        or os.environ.get("BENCH_STRICT_CACHE") == "1"
+    ):
         from numba.core.dispatcher import _FunctionCompiler
 
         compile_original = _FunctionCompiler.compile
@@ -55,7 +58,22 @@ def install(flow_cache=Path("/results/cache/flows")):
             if filename.is_relative_to(flow_cache):
                 with (records / f"cache-miss-{os.getpid()}.txt").open("a") as stream:
                     stream.write(str(filename) + "\n")
-                raise RuntimeError(f"Measured Sharrow flow cache miss: {filename}")
+                detail = {
+                    "flow": str(filename),
+                    "function": self.py_func.__name__,
+                    "signature": str(args[0] if args else kwargs),
+                    "process": multiprocessing.current_process().name,
+                }
+                with (records / f"cache-miss-details-{os.getpid()}.jsonl").open(
+                    "a"
+                ) as stream:
+                    stream.write(json.dumps(detail) + "\n")
+                # Preserve strict mode for old runners and diagnostic tools.
+                # New runs compile, finish, and let the host reject this attempt.
+                if os.environ.get("BENCH_STRICT_CACHE") == "1":
+                    raise RuntimeError(
+                        f"Measured Sharrow flow cache miss: {filename} ({self.py_func.__name__}); required signature: {detail['signature']}"
+                    )
             return compile_original(self, *args, **kwargs)
 
         _FunctionCompiler.compile = compile_checked
